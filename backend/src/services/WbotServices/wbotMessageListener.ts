@@ -22,6 +22,7 @@ import {
 import Contact from "../../models/Contact";
 import Ticket from "../../models/Ticket";
 import Message from "../../models/Message";
+import bdTemp from "./Tmp"
 
 import { getIO } from "../../libs/socket";
 import CreateMessageService from "../MessageServices/CreateMessageService";
@@ -640,7 +641,7 @@ export const verifyMessage = async (
     id: msg.key.id,
     ticketId: ticket.id,
     contactId: msg.key.fromMe ? undefined : contact.id,
-    body,
+    body: body,
     fromMe: msg.key.fromMe,
     mediaType: getTypeMessage(msg),
     read: msg.key.fromMe,
@@ -713,7 +714,10 @@ const isValidMsg = (msg: proto.IWebMessageInfo): boolean => {
       msgType === "protocolMessage" ||
       msgType === "listResponseMessage" ||
       msgType === "listMessage" ||
-      msgType === "viewOnceMessage";
+      msgType === "viewOnceMessage" ||
+      msgType === "documentWithCaptionMessage";
+
+    console.log('tipo', ifType)
 
     if (!ifType) {
       logger.warn(`#### Nao achou o type em isValidMsg: ${msgType}
@@ -1197,7 +1201,36 @@ const handleChartbot = async (ticket: Ticket, msg: WAMessage, wbot: Session, don
       ],
     });
 
-    if (queueOptions.length > -1) {
+
+    if (queueOptions.length == 0) {
+      const textMessage = {
+        text: formatBody(`${currentOption.message}`, ticket.contact),
+      };
+
+      const lastMessageFromMe = await Message.findOne({
+        where: {
+          ticketId: ticket.id,
+          fromMe: true,
+          body: textMessage.text
+        },
+        order: [["createdAt", "DESC"]]
+      });
+
+      if (lastMessageFromMe) {
+        return;
+      }
+
+      const sendMsg = await wbot.sendMessage(
+        `${ticket.contact.number}@${ticket.isGroup ? "g.us" : "s.whatsapp.net"}`,
+        textMessage
+      );
+
+      await verifyMessage(sendMsg, ticket, ticket.contact);
+
+      return
+    }
+
+    if (queueOptions.length > 1) {
 
       const companyId = ticket.companyId;
       const buttonActive = await Setting.findOne({
@@ -1328,15 +1361,31 @@ const handleMessage = async (
       },
     });
 
-    const bodyMessage = getBodyMessage(msg);
+    const bodyMessage = await getBodyMessage(msg);
     const msgType = getTypeMessage(msg);
 
+    if (msgType === "protocolMessage") return; // Tratar isso no futuro para excluir msgs se vor REVOKE
     const hasMedia =
       msg.message?.audioMessage ||
       msg.message?.imageMessage ||
       msg.message?.videoMessage ||
       msg.message?.documentMessage ||
-      msg.message.stickerMessage;
+      msg.message.stickerMessage ||
+      msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage ||
+      msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage ||
+      msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.audioMessage ||
+      msg?.message?.ephemeralMessage?.message?.imageMessage ||
+      msg?.message?.ephemeralMessage?.message?.audioMessage ||
+      msg?.message?.ephemeralMessage?.message?.videoMessage ||
+      msg?.message?.ephemeralMessage?.message?.documentMessage ||
+      msg?.message?.ephemeralMessage?.message?.stickerMessage ||
+      msg.message?.viewOnceMessage?.message?.imageMessage ||
+      msg.message?.viewOnceMessage?.message?.videoMessage ||
+      msg.message?.ephemeralMessage?.message?.viewOnceMessage?.message?.imageMessage ||
+      msg.message?.ephemeralMessage?.message?.viewOnceMessage?.message?.videoMessage ||
+      msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+
+
     if (msg.key.fromMe) {
       if (/\u200e/.test(bodyMessage)) return;
 
@@ -1344,7 +1393,10 @@ const handleMessage = async (
         !hasMedia &&
         msgType !== "conversation" &&
         msgType !== "extendedTextMessage" &&
-        msgType !== "vcard"
+        msgType !== "vcard" &&
+        msgType !== "reactionMessage" &&
+        msgType !== "ephemeralMessage" &&
+        msgType !== "protocolMessage"
       )
         return;
       msgContact = await getContactMessage(msg, wbot);
@@ -1355,12 +1407,63 @@ const handleMessage = async (
     if (msgIsGroupBlock?.value === "enabled" && isGroup) return;
 
     if (isGroup) {
-      const grupoMeta = await wbot.groupMetadata(msg.key.remoteJid, false);
-      const msgGroupContact = {
-        id: grupoMeta.id,
-        name: grupoMeta.subject
-      };
-      groupContact = await verifyContact(msgGroupContact, wbot, companyId);
+      try {
+
+        //Verificar se bdTemp[msg.key.remoteJid] tem createdAt e se ja tem mais de 10 minutos em relação ao momento atual
+        if (bdTemp[msg.key.remoteJid] && bdTemp[msg.key.remoteJid]?.grupo?.createdAt && bdTemp[msg.key.remoteJid].grupo) {
+          const createdAt = bdTemp[msg.key.remoteJid]?.grupo.createdAt;
+          const now = new Date();
+          const diff = now.getTime() - createdAt.getTime();
+          const minutes = Math.floor(diff / 60000);
+
+          if (minutes > 10) {
+            //sleep de meio segundo para evitar bloqueio
+            await new Promise(resolve => setTimeout(resolve, 500));
+            let temp = await wbot.groupMetadata(msg.key.remoteJid);
+            temp["createdAt"] = new Date();
+            bdTemp[msg.key.remoteJid].grupo = temp
+          }
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          let temp = await wbot.groupMetadata(msg.key.remoteJid);
+          temp["createdAt"] = new Date();
+          bdTemp[msg.key.remoteJid] = { grupo: temp, ...bdTemp[msg.key.remoteJid] };
+        }
+
+        const grupoMeta = bdTemp[msg.key.remoteJid].grupo;
+
+        const msgGroupContact = {
+          id: grupoMeta.id,
+          name: grupoMeta.subject,
+        };
+        groupContact = await verifyContact(msgGroupContact, wbot, companyId);
+        if (bodyMessage && bodyMessage.toUpperCase() === "##KEYGROUP") {
+
+          const sentMessage = await wbot.sendMessage(
+            `${msg.key.remoteJid}`,
+            {
+              text: `Grupo id: ${grupoMeta.id} \nNome: ${grupoMeta.subject} \nQtd Participantes: ${grupoMeta.participants.length}\n \nParticipantes:\n${grupoMeta.participants.map((participant: { id: any; admin: any; }) => `${participant.id} ${participant.admin ? participant.admin : ""}`).join("\n")}`,
+            }
+          );
+        }
+        if (bodyMessage && bodyMessage.toUpperCase() === "##REAJA") {
+          const emoticons = ['🤘🏽', '💖', '👏🏻', '🙏🏻', '🤓']
+          const reactionMessage = {
+            react: {
+              text: emoticons[Math.floor(Math.random() * emoticons.length)] || '😬',
+              key: msg.key
+            }
+          }
+          const sentMessage = await wbot.sendMessage(
+            `${msg.key.remoteJid}`, reactionMessage)
+        }
+      } catch (err) {
+        console.log(err);
+        Sentry.setExtra('Error isGroup', { companyId, msg, });
+        Sentry.captureException(err);
+        logger.error(`Error isGroup: Err: ${err}`);
+        throw new Error("ERR_ISGROUP_LISTNER");
+      }
     }
 
     const whatsapp = await ShowWhatsAppService(wbot.id!, companyId);
@@ -1422,30 +1525,7 @@ const handleMessage = async (
         /**
          * Tratamento para avaliação do atendente
          */
-
-         // dev Ricardo: insistir a responder avaliação 
-         const rate_ = Number(bodyMessage);
-
-         if ((ticket?.lastMessage.includes('_Insatisfeito_') || ticket?.lastMessage.includes('Por favor avalie nosso atendimento.')) &&  (!isFinite(rate_))) {
-             const debouncedSentMessage = debounce(
-               async () => {
-                 await wbot.sendMessage(
-                   `${ticket.contact.number}@${ticket.isGroup ? "g.us" : "s.whatsapp.net"
-                   }`,
-                   {
-                     text: 'Por favor avalie nosso atendimento.'
-                   }
-                 );
-               },
-               1000,
-               ticket.id
-             );
-             debouncedSentMessage();
-             return;
-         }
-         // dev Ricardo
-
-        if (ticketTraking !== null && verifyRating(ticketTraking)) {
+        if (verifyRating(ticketTraking)) {
           handleRating(msg, ticket, ticketTraking);
           return;
         }
@@ -1775,7 +1855,7 @@ const verifyCampaignMessageAndCloseTicket = async (
   companyId: number
 ) => {
   const io = getIO();
-  const body = getBodyMessage(message);
+  const body = await getBodyMessage(message);
   const isCampaign = /\u200c/.test(body);
   if (message.key.fromMe && isCampaign) {
     const messageRecord = await Message.findOne({
@@ -1826,14 +1906,29 @@ const wbotMessageListener = async (wbot: Session, companyId: number): Promise<vo
       if (!messages) return;
 
       messages.forEach(async (message: proto.IWebMessageInfo) => {
+
+        // if (
+        //   !message.key.fromMe &&
+        //   messageUpsert.type === "notify"
+        // ) {
+        //   (wbot as WASocket)!.readMessages([message.key]);
+        // }
+
         const messageExists = await Message.count({
           where: { id: message.key.id!, companyId }
         });
 
         if (!messageExists) {
-          await handleMessage(message, wbot, companyId);
-          await verifyRecentCampaign(message, companyId);
+
+          const body = await getBodyMessage(message);
+          const isCampaign = /\u200c/.test(body);
+
+          if (!isCampaign) {
+            await handleMessage(message, wbot, companyId);
+          }
+
           await verifyCampaignMessageAndCloseTicket(message, companyId);
+          await verifyRecentCampaign(message, companyId);
         }
       });
     });
@@ -1841,9 +1936,15 @@ const wbotMessageListener = async (wbot: Session, companyId: number): Promise<vo
     wbot.ev.on("messages.update", (messageUpdate: WAMessageUpdate[]) => {
       if (messageUpdate.length === 0) return;
       messageUpdate.forEach(async (message: WAMessageUpdate) => {
-        (wbot as WASocket)!.readMessages([message.key])
 
-        handleMsgAck(message, message.update.status);
+        let ack: any;
+        if (message.update.status === 3 && message?.key?.fromMe) {
+          ack = 2;
+        } else {
+          ack = message.update.status;
+        }
+
+        handleMsgAck(message, ack);
       });
     });
 
