@@ -233,7 +233,7 @@ const TicketsManagerTabs = () => {
           <>
             <Button
               variant="outlined"
-              style={{ backgroundColor: "#38a0d6", color: "#ffffff" }}
+              color="primary"
               onClick={() => setNewTicketModalOpen(true)}
             >
               {i18n.t("ticketsManager.buttons.newTicket")}
